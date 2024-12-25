@@ -62,19 +62,20 @@ void onMQTTConfigChange(const String& server, const int port, const String& user
 }
 
 void setup_wifi() {
-  delay(100);
-  Serial.println("正在连接WiFi...");    
-  WiFiManager wifiManager;
-  wifiManager.autoConnect("Boiler-WiFi", "12345678");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.println("等待连接WiFi...");
-  }
-  Serial.println("");
-  Serial.println("WiFi已连接");
-  Serial.println("IP地址: ");
-  Serial.println(WiFi.localIP());
-
+    
+    delay(100);
+    Serial.println("正在连接WiFi...");    
+    WiFiManager wifiManager;
+    wifiManager.autoConnect("Boiler-WiFi", "12345678");
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.println("等待连接WiFi...");
+    }
+    Serial.println("");
+    Serial.println("WiFi已连接");
+    Serial.println("IP地址: ");
+    Serial.println(WiFi.localIP());
+    
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
