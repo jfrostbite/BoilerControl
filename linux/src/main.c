@@ -33,11 +33,14 @@ static int esp8266_online = 0;  // ESP8266在线状态
 static time_t last_heartbeat = 0;  // 上次发送心跳的时间
 
 static TempControl temp_control = {
-    .temp_target = 20.0,
-    .temp_hysteresis = 0.5,
-    .heater_state = 0,
-    .current_temp = 0.0,
-    .current_humidity = 0.0
+    .day_temp_target = 21.0,    // 白天目标温度
+    .night_temp_target = 20.0,  // 夜间目标温度
+    .temp_hysteresis = 0.5,     // 温度滞后
+    .heater_state = 0,          // 加热器状态
+    .current_temp = 0.0,        // 当前温度
+    .current_humidity = 0.0,    // 当前湿度
+    .day_start_hour = 6,        // 早上6点开始
+    .night_start_hour = 22      // 晚上10点结束
 };
 
 // 函数声明
@@ -132,6 +135,56 @@ void mqtt_message_callback(struct mosquitto *mosq, void *obj, const struct mosqu
         } else if (strncmp(message->payload, "offline", 7) == 0) {
             esp8266_online = 0;
             logger_log(LOG_LEVEL_INFO, "ESP8266已离线");
+        }
+    }
+}
+
+// 获取当前小时
+static int get_current_hour() {
+    time_t now;
+    struct tm *timeinfo;
+    time(&now);
+    timeinfo = localtime(&now);
+    return timeinfo->tm_hour;
+}
+
+// 获取当前目标温度
+static float get_current_target_temp(TempControl *ctrl) {
+    int current_hour = get_current_hour();
+    if (current_hour >= ctrl->day_start_hour && current_hour < ctrl->night_start_hour) {
+        return ctrl->day_temp_target;
+    } else {
+        return ctrl->night_temp_target;
+    }
+}
+
+// 在主循环中使用新的目标温度获取函数
+void temp_control_loop(TempControl *ctrl, struct mosquitto *mosq) {
+    float target_temp = get_current_target_temp(ctrl);
+    int rc;
+    
+    // 如果当前温度低于目标温度减去滞后值，开启加热
+    if (ctrl->current_temp < target_temp - ctrl->temp_hysteresis) {
+        if (!ctrl->heater_state) {
+            rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_CONTROL, 2, "ON", 0, false);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                logger_log(LOG_LEVEL_ERROR, "MQTT发布失败: %s", mosquitto_strerror(rc));
+            }
+            ctrl->heater_state = 1;
+            add_log("加热器开启：当前温度 %.1f°C < 目标温度 %.1f°C - %.1f°C", 
+                   ctrl->current_temp, target_temp, ctrl->temp_hysteresis);
+        }
+    }
+    // 如果当前温度高于目标温度，关闭加热
+    else if (ctrl->current_temp > target_temp) {
+        if (ctrl->heater_state) {
+            rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_CONTROL, 3, "OFF", 0, false);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                logger_log(LOG_LEVEL_ERROR, "MQTT发布失败: %s", mosquitto_strerror(rc));
+            }
+            ctrl->heater_state = 0;
+            add_log("加热器关闭：当前温度 %.1f°C > 目标温度 %.1f°C", 
+                   ctrl->current_temp, target_temp);
         }
     }
 }
@@ -232,21 +285,7 @@ int main(int argc, char *argv[]) {
             // 只在ESP8266在线时执行温控逻辑
             if (esp8266_online) {
                 // 温度控制逻辑
-                if (temp_control.current_temp < temp_control.temp_target - temp_control.temp_hysteresis && 
-                    !temp_control.heater_state) {
-                    rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_CONTROL, 2, "ON", 0, false);
-                    if (rc != MOSQ_ERR_SUCCESS) {
-                        logger_log(LOG_LEVEL_ERROR, "MQTT发布失败: %s", mosquitto_strerror(rc));
-                    }
-                    logger_log(LOG_LEVEL_INFO, "发送开启加热命令");
-                } else if (temp_control.current_temp > temp_control.temp_target + temp_control.temp_hysteresis && 
-                          temp_control.heater_state) {
-                    rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_CONTROL, 3, "OFF", 0, false);
-                    if (rc != MOSQ_ERR_SUCCESS) {
-                        logger_log(LOG_LEVEL_ERROR, "MQTT发布失败: %s", mosquitto_strerror(rc));
-                    }
-                    logger_log(LOG_LEVEL_INFO, "发送关闭加热命令");
-                }
+                temp_control_loop(&temp_control, mosq);
             } else {
                 logger_log(LOG_LEVEL_INFO, "ESP8266离线，等待设备重新连接...");
             }

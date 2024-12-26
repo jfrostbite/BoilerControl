@@ -17,11 +17,14 @@ typedef struct {
 
 // 温控器配置结构体
 typedef struct {
-    float temp_target;      // 目标温度
-    float temp_hysteresis;  // 温度滞后
-    int heater_state;      // 加热器状态
-    float current_temp;    // 当前温度
+    float day_temp_target;   // 白天目标温度
+    float night_temp_target; // 夜间目标温度
+    float temp_hysteresis;   // 温度滞后
+    int heater_state;       // 加热器状态
+    float current_temp;     // 当前温度
     float current_humidity; // 当前湿度
+    int day_start_hour;     // 白天开始时间（小时）
+    int night_start_hour;   // 夜间开始时间（小时）
 } TempControl;
 
 // 函数声明

@@ -49,8 +49,11 @@ void add_log(const char *format, ...) {
 // 保存配置到文件
 int save_config(const TempControl *ctrl) {
     json_object *json = json_object_new_object();
-    json_object_object_add(json, "target_temp", json_object_new_double(ctrl->temp_target));
+    json_object_object_add(json, "day_temp_target", json_object_new_double(ctrl->day_temp_target));
+    json_object_object_add(json, "night_temp_target", json_object_new_double(ctrl->night_temp_target));
     json_object_object_add(json, "hysteresis", json_object_new_double(ctrl->temp_hysteresis));
+    json_object_object_add(json, "day_start_hour", json_object_new_int(ctrl->day_start_hour));
+    json_object_object_add(json, "night_start_hour", json_object_new_int(ctrl->night_start_hour));
     
     const char *json_str = json_object_to_json_string(json);
     FILE *fp = fopen(CONFIG_FILE, "w");
@@ -72,10 +75,13 @@ int load_config(TempControl *ctrl) {
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
         printf("加载配置失败: %s\n", strerror(errno));
-        printf("使用默认配置: 目标温度=20.0°C, 温度滞后=0.5°C\n");
+        printf("使用默认配置\n");
         // 使用默认值
-        ctrl->temp_target = 20.0;
+        ctrl->day_temp_target = 21.0;
+        ctrl->night_temp_target = 20.0;
         ctrl->temp_hysteresis = 0.5;
+        ctrl->day_start_hour = 6;    // 早上6点
+        ctrl->night_start_hour = 22; // 晚上10点
         // 尝试创建配置文件
         save_config(ctrl);
         return 0;  // 不将其视为错误
@@ -85,15 +91,21 @@ int load_config(TempControl *ctrl) {
     if (fgets(buffer, sizeof(buffer), fp)) {
         json_object *json = json_tokener_parse(buffer);
         if (json) {
-            json_object *temp_obj;
-            if (json_object_object_get_ex(json, "target_temp", &temp_obj)) {
-                ctrl->temp_target = json_object_get_double(temp_obj);
-                printf("加载目标温度: %.1f°C\n", ctrl->temp_target);
+            json_object *obj;
+            if (json_object_object_get_ex(json, "day_temp_target", &obj)) {
+                ctrl->day_temp_target = json_object_get_double(obj);
             }
-            json_object *hyst_obj;
-            if (json_object_object_get_ex(json, "hysteresis", &hyst_obj)) {
-                ctrl->temp_hysteresis = json_object_get_double(hyst_obj);
-                printf("加载温度滞后: %.1f°C\n", ctrl->temp_hysteresis);
+            if (json_object_object_get_ex(json, "night_temp_target", &obj)) {
+                ctrl->night_temp_target = json_object_get_double(obj);
+            }
+            if (json_object_object_get_ex(json, "hysteresis", &obj)) {
+                ctrl->temp_hysteresis = json_object_get_double(obj);
+            }
+            if (json_object_object_get_ex(json, "day_start_hour", &obj)) {
+                ctrl->day_start_hour = json_object_get_int(obj);
+            }
+            if (json_object_object_get_ex(json, "night_start_hour", &obj)) {
+                ctrl->night_start_hour = json_object_get_int(obj);
             }
             json_object_put(json);
         }
@@ -107,8 +119,11 @@ int load_config(TempControl *ctrl) {
 static const char* HTML_PAGE = 
 "<!DOCTYPE html>"
 "<html><head><meta charset='utf-8'>"
-"<title>温控器控制面板</title>"
+"<title>壁挂炉控制</title>"
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>"
+"<script src='https://cdn.jsdelivr.net/npm/moment@2.29.4/moment.min.js'></script>"
+"<script src='https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.1/dist/chartjs-adapter-moment.min.js'></script>"
 "<style>"
 "body {"
 "    margin: 0;"
@@ -127,6 +142,11 @@ static const char* HTML_PAGE =
 "    margin: 16px 0;"
 "    border-radius: 12px;"
 "    box-shadow: 0 2px 8px rgba(0,0,0,0.1);"
+"}"
+".chart-container {"
+"    position: relative;"
+"    height: 300px;"  // 固定高度
+"    margin: 20px 0;"
 "}"
 ".card h2 {"
 "    margin: 0 0 20px 0;"
@@ -281,20 +301,34 @@ static const char* HTML_PAGE =
 "    <div class='card'>"
 "        <h2>温度控制</h2>"
 "        <div class='control'>"
-"            <div class='control-label'>目标温度</div>"
+"            <div class='control-label'>白天温度 (6:00-22:00)</div>"
 "            <div class='control-input'>"
-"                <input type='number' id='target' step='0.5' min='5' max='30'>"
+"                <input type='number' id='day_target' step='0.1' min='5' max='30'>"
 "                <span>°C</span>"
-"                <button onclick='setTarget()'>设置</button>"
+"                <button onclick='setDayTarget()'>设置</button>"
+"            </div>"
+"        </div>"
+"        <div class='control'>"
+"            <div class='control-label'>夜间温度 (22:00-6:00)</div>"
+"            <div class='control-input'>"
+"                <input type='number' id='night_target' step='0.1' min='5' max='30'>"
+"                <span>°C</span>"
+"                <button onclick='setNightTarget()'>设置</button>"
 "            </div>"
 "        </div>"
 "        <div class='control'>"
 "            <div class='control-label'>温度滞后</div>"
 "            <div class='control-input'>"
-"                <input type='number' id='hysteresis' step='0.1' min='0.1' max='2'>"
+"                <input type='number' id='hysteresis' step='0.1' min='0.1' max='2.0'>"
 "                <span>°C</span>"
 "                <button onclick='setHysteresis()'>设置</button>"
 "            </div>"
+"        </div>"
+"    </div>"
+"    <div class='card'>"
+"        <h2>温度曲线</h2>"
+"        <div class='chart-container'>"
+"            <canvas id='tempChart'></canvas>"
 "        </div>"
 "    </div>"
 "    <div class='card'>"
@@ -304,6 +338,122 @@ static const char* HTML_PAGE =
 "</div>"
 "<div id='toast' class='toast'></div>"
 "<script>"
+"var tempData = {"
+"    labels: [],"
+"    datasets: [{"
+"        label: '温度 (°C)',"
+"        data: [],"
+"        borderColor: 'rgb(75, 192, 192)',"
+"        backgroundColor: 'rgba(75, 192, 192, 0.1)',"
+"        fill: true,"
+"        tension: 0.3,"
+"        yAxisID: 'y',"
+"        pointRadius: 0,"
+"        borderWidth: 2"
+"    }, {"
+"        label: '加热状态',"
+"        data: [],"
+"        borderColor: 'rgb(255, 99, 132)',"
+"        backgroundColor: 'rgba(255, 99, 132, 0.1)',"
+"        fill: true,"
+"        stepped: true,"
+"        yAxisID: 'y1',"
+"        pointRadius: 0,"
+"        borderWidth: 2"
+"    }]"
+"};"
+""
+"var tempConfig = {"
+"    type: 'line',"
+"    data: tempData,"
+"    options: {"
+"        responsive: true,"
+"        maintainAspectRatio: false,"
+"        interaction: {"
+"            mode: 'index',"
+"            intersect: false"
+"        },"
+"        plugins: {"
+"            legend: {"
+"                position: 'top',"
+"                labels: {"
+"                    usePointStyle: true,"
+"                    padding: 20"
+"                }"
+"            }"
+"        },"
+"        scales: {"
+"            x: {"
+"                type: 'time',"
+"                time: {"
+"                    unit: 'minute',"
+"                    displayFormats: {"
+"                        minute: 'HH:mm'"
+"                    }"
+"                },"
+"                grid: {"
+"                    display: false"
+"                },"
+"                title: {"
+"                    display: true,"
+"                    text: '时间'"
+"                }"
+"            },"
+"            y: {"
+"                type: 'linear',"
+"                display: true,"
+"                position: 'left',"
+"                title: {"
+"                    display: true,"
+"                    text: '温度 (°C)'"
+"                }"
+"            },"
+"            y1: {"
+"                type: 'linear',"
+"                display: true,"
+"                position: 'right',"
+"                min: -0.1,"
+"                max: 1.1,"
+"                grid: {"
+"                    drawOnChartArea: false"
+"                },"
+"                title: {"
+"                    display: true,"
+"                    text: '加热状态'"
+"                },"
+"                ticks: {"
+"                    callback: function(value) {"
+"                        return value > 0.5 ? '开启' : '关闭';"
+"                    }"
+"                }"
+"            }"
+"        }"
+"    }"
+"};"
+""
+"var ctx = document.getElementById('tempChart').getContext('2d');"
+"var tempChart = new Chart(ctx, tempConfig);"
+""
+"function updateChart(temp, heaterState) {"
+"    var now = new Date();"
+"    tempData.labels.push(now);"
+"    tempData.datasets[0].data.push(temp);"
+"    tempData.datasets[1].data.push(heaterState ? 1 : 0);"
+"    "
+"    var twoHoursAgo = now - 2 * 60 * 60 * 1000;"
+"    var cutoffIndex = tempData.labels.findIndex(function(time) {"
+"        return time > twoHoursAgo;"
+"    });"
+"    "
+"    if (cutoffIndex > 0) {"
+"        tempData.labels.splice(0, cutoffIndex);"
+"        tempData.datasets[0].data.splice(0, cutoffIndex);"
+"        tempData.datasets[1].data.splice(0, cutoffIndex);"
+"    }"
+"    "
+"    tempChart.update();"
+"}"
+""
 "function updateStatus() {"
 "    fetch('/api/status').then(r=>r.json()).then(data=>{"
 "        document.getElementById('temp').textContent = `${data.current_temp.toFixed(1)}°C`;"
@@ -311,11 +461,13 @@ static const char* HTML_PAGE =
 "        document.getElementById('heater').textContent = data.heater_state ? '开启' : '关闭';"
 "        document.getElementById('heater').className = "
 "            'status-value ' + (data.heater_state ? 'heater-on' : 'heater-off');"
+"        updateChart(data.current_temp, data.heater_state);"
 "    }).catch(err => console.error('更新状态失败:', err));"
 "}"
 "function loadSettings() {"
 "    fetch('/api/status').then(r=>r.json()).then(data=>{"
-"        document.getElementById('target').value = data.target_temp.toFixed(1);"
+"        document.getElementById('day_target').value = data.day_temp_target.toFixed(1);"
+"        document.getElementById('night_target').value = data.night_temp_target.toFixed(1);"
 "        document.getElementById('hysteresis').value = data.hysteresis.toFixed(1);"
 "    }).catch(err => console.error('加载设置失败:', err));"
 "}"
@@ -333,22 +485,43 @@ static const char* HTML_PAGE =
 "        btn.classList.remove('loading');"
 "    }"
 "}"
-"function setTarget() {"
+"function setDayTarget() {"
 "    const btn = event.target;"
-"    const temp = document.getElementById('target').value;"
+"    const temp = document.getElementById('day_target').value;"
 "    setButtonLoading(btn, true);"
 "    fetch('/api/settings', {"
 "        method: 'POST',"
 "        headers: {'Content-Type': 'application/json'},"
-"        body: JSON.stringify({target_temp: parseFloat(temp)})"
+"        body: JSON.stringify({day_temp_target: parseFloat(temp)})"
 "    }).then(r => r.json())"
 "      .then(data => {"
 "        if(data.status === 'success') {"
-"            document.getElementById('target').value = data.target_temp.toFixed(1);"
-"            showToast('目标温度已更新');"
+"            document.getElementById('day_target').value = data.day_temp_target.toFixed(1);"
+"            showToast('白天温度已更新');"
 "        }"
 "    }).catch(err => {"
-"        console.error('设置目标温度失败:', err);"
+"        console.error('设置白天温度失败:', err);"
+"        showToast('设置失败，请重试');"
+"    }).finally(() => {"
+"        setButtonLoading(btn, false);"
+"    });"
+"}"
+"function setNightTarget() {"
+"    const btn = event.target;"
+"    const temp = document.getElementById('night_target').value;"
+"    setButtonLoading(btn, true);"
+"    fetch('/api/settings', {"
+"        method: 'POST',"
+"        headers: {'Content-Type': 'application/json'},"
+"        body: JSON.stringify({night_temp_target: parseFloat(temp)})"
+"    }).then(r => r.json())"
+"      .then(data => {"
+"        if(data.status === 'success') {"
+"            document.getElementById('night_target').value = data.night_temp_target.toFixed(1);"
+"            showToast('夜间温度已更新');"
+"        }"
+"    }).catch(err => {"
+"        console.error('设置夜间温度失败:', err);"
 "        showToast('设置失败，请重试');"
 "    }).finally(() => {"
 "        setButtonLoading(btn, false);"
@@ -411,10 +584,11 @@ static enum MHD_Result handle_get_request(void *cls, struct MHD_Connection *conn
     } else if (strcmp(url, "/api/status") == 0) {
         // 创建JSON响应
         json_object *json = json_object_new_object();
-        json_object_object_add(json, "target_temp", json_object_new_double(temp_control->temp_target));
-        json_object_object_add(json, "hysteresis", json_object_new_double(temp_control->temp_hysteresis));
         json_object_object_add(json, "current_temp", json_object_new_double(temp_control->current_temp));
         json_object_object_add(json, "current_humidity", json_object_new_double(temp_control->current_humidity));
+        json_object_object_add(json, "day_temp_target", json_object_new_double(temp_control->day_temp_target));
+        json_object_object_add(json, "night_temp_target", json_object_new_double(temp_control->night_temp_target));
+        json_object_object_add(json, "hysteresis", json_object_new_double(temp_control->temp_hysteresis));
         json_object_object_add(json, "heater_state", json_object_new_boolean(temp_control->heater_state));
         
         const char *json_str = json_object_to_json_string(json);
@@ -492,10 +666,17 @@ static enum MHD_Result handle_post_request(void *cls, struct MHD_Connection *con
         // 解析JSON请求
         json_object *json = json_tokener_parse(buffer);
         if (json) {
-            json_object *temp_obj;
-            if (json_object_object_get_ex(json, "target_temp", &temp_obj)) {
-                temp_control->temp_target = json_object_get_double(temp_obj);
-                printf("更新目标温度: %.1f°C\n", temp_control->temp_target);
+            json_object *day_temp_obj;
+            if (json_object_object_get_ex(json, "day_temp_target", &day_temp_obj)) {
+                temp_control->day_temp_target = json_object_get_double(day_temp_obj);
+                printf("更新白天目标温度: %.1f°C\n", temp_control->day_temp_target);
+                save_config(temp_control);
+            }
+            json_object *night_temp_obj;
+            if (json_object_object_get_ex(json, "night_temp_target", &night_temp_obj)) {
+                temp_control->night_temp_target = json_object_get_double(night_temp_obj);
+                printf("更新夜间目标温度: %.1f°C\n", temp_control->night_temp_target);
+                save_config(temp_control);
             }
             json_object *hyst_obj;
             if (json_object_object_get_ex(json, "hysteresis", &hyst_obj)) {
@@ -516,7 +697,8 @@ static enum MHD_Result handle_post_request(void *cls, struct MHD_Connection *con
     // 创建响应
     json_object *response_json = json_object_new_object();
     json_object_object_add(response_json, "status", json_object_new_string("success"));
-    json_object_object_add(response_json, "target_temp", json_object_new_double(temp_control->temp_target));
+    json_object_object_add(response_json, "day_temp_target", json_object_new_double(temp_control->day_temp_target));
+    json_object_object_add(response_json, "night_temp_target", json_object_new_double(temp_control->night_temp_target));
     json_object_object_add(response_json, "hysteresis", json_object_new_double(temp_control->temp_hysteresis));
     
     const char *json_str = json_object_to_json_string(response_json);
