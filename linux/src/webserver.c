@@ -1,15 +1,62 @@
+#define _XOPEN_SOURCE
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <dirent.h>     // 用于目录操作
+#include <limits.h>     // 用于 PATH_MAX
 #include "webserver.h"
+#include "logger.h"
+#include "index_html.h"
+#include "database.h"
+#include "utils.h"
 
 static struct MHD_Daemon *httpd;
 static TempControl *temp_control;
 static LogEntry logs[MAX_LOGS];  // 日志数组
 static int log_count = 0;        // 当前日志数量
+
+// 初始化配置目录
+int init_config_dir(void) {
+    char* config_path = expand_path(CONFIG_DIR);
+    char* data_path = expand_path(DATA_DIR);
+    
+    if (!config_path || !data_path) {
+        free(config_path);
+        free(data_path);
+        return -1;
+    }
+
+    // 创建配置目录
+    struct stat st = {0};
+    if (stat(config_path, &st) == -1) {
+        if (mkdir(config_path, 0755) == -1) {
+            free(config_path);
+            free(data_path);
+            return -1;
+        }
+    }
+
+    // 创建数据目录
+    if (stat(data_path, &st) == -1) {
+        if (mkdir(data_path, 0755) == -1) {
+            free(config_path);
+            free(data_path);
+            return -1;
+        }
+    }
+
+    free(config_path);
+    free(data_path);
+    return 0;
+}
 
 // 获取当前时间字符串
 static void get_timestamp(char *buffer, size_t size) {
@@ -48,6 +95,12 @@ void add_log(const char *format, ...) {
 
 // 保存配置到文件
 int save_config(const TempControl *ctrl) {
+    char* config_path = expand_path(CONFIG_FILE);
+    if (!config_path) {
+        printf("展开配置文件路径失败\n");
+        return -1;
+    }
+
     json_object *json = json_object_new_object();
     json_object_object_add(json, "day_temp_target", json_object_new_double(ctrl->day_temp_target));
     json_object_object_add(json, "night_temp_target", json_object_new_double(ctrl->night_temp_target));
@@ -56,23 +109,31 @@ int save_config(const TempControl *ctrl) {
     json_object_object_add(json, "night_start_hour", json_object_new_int(ctrl->night_start_hour));
     
     const char *json_str = json_object_to_json_string(json);
-    FILE *fp = fopen(CONFIG_FILE, "w");
+    FILE *fp = fopen(config_path, "w");
     if (!fp) {
         printf("保存配置失败: %s\n", strerror(errno));
         json_object_put(json);
+        free(config_path);
         return -1;
     }
     
     fprintf(fp, "%s\n", json_str);
     fclose(fp);
     json_object_put(json);
-    printf("配置已保存到 %s\n", CONFIG_FILE);
+    printf("配置已保存到 %s\n", config_path);
+    free(config_path);
     return 0;
 }
 
 // 从文件加载配置
 int load_config(TempControl *ctrl) {
-    FILE *fp = fopen(CONFIG_FILE, "r");
+    char* config_path = expand_path(CONFIG_FILE);
+    if (!config_path) {
+        printf("展开配置文件路径失败\n");
+        return -1;
+    }
+
+    FILE *fp = fopen(config_path, "r");
     if (!fp) {
         printf("加载配置失败: %s\n", strerror(errno));
         printf("使用默认配置\n");
@@ -82,6 +143,7 @@ int load_config(TempControl *ctrl) {
         ctrl->temp_hysteresis = 0.5;
         ctrl->day_start_hour = 6;    // 早上6点
         ctrl->night_start_hour = 22; // 晚上10点
+        free(config_path);
         // 尝试创建配置文件
         save_config(ctrl);
         return 0;  // 不将其视为错误
@@ -112,460 +174,23 @@ int load_config(TempControl *ctrl) {
     }
     
     fclose(fp);
+    free(config_path);
     return 0;
 }
 
-// HTML页面内容
-static const char* HTML_PAGE = 
-"<!DOCTYPE html>"
-"<html><head><meta charset='utf-8'>"
-"<title>壁挂炉控制</title>"
-"<meta name='viewport' content='width=device-width, initial-scale=1'>"
-"<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>"
-"<script src='https://cdn.jsdelivr.net/npm/moment@2.29.4/moment.min.js'></script>"
-"<script src='https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.1/dist/chartjs-adapter-moment.min.js'></script>"
-"<style>"
-"body {"
-"    margin: 0;"
-"    padding: 20px;"
-"    font-family: Arial, sans-serif;"
-"    background: #f0f2f5;"
-"    min-height: 100vh;"
-"}"
-".container {"
-"    max-width: 800px;"
-"    margin: 0 auto;"
-"}"
-".card {"
-"    background: #fff;"
-"    padding: 24px;"
-"    margin: 16px 0;"
-"    border-radius: 12px;"
-"    box-shadow: 0 2px 8px rgba(0,0,0,0.1);"
-"}"
-".chart-container {"
-"    position: relative;"
-"    height: 300px;"  // 固定高度
-"    margin: 20px 0;"
-"}"
-".card h2 {"
-"    margin: 0 0 20px 0;"
-"    color: #1a1a1a;"
-"    font-size: 1.5em;"
-"}"
-".status {"
-"    display: grid;"
-"    grid-template-columns: repeat(3, 1fr);"
-"    gap: 16px;"
-"    text-align: center;"
-"}"
-".status-item {"
-"    padding: 16px;"
-"    background: #f8f9fa;"
-"    border-radius: 8px;"
-"    font-size: 1.2em;"
-"}"
-".status-label {"
-"    color: #666;"
-"    font-size: 0.9em;"
-"    margin-bottom: 8px;"
-"}"
-".status-value {"
-"    color: #1a1a1a;"
-"    font-weight: bold;"
-"}"
-".control {"
-"    display: flex;"
-"    align-items: center;"
-"    justify-content: space-between;"
-"    margin: 16px 0;"
-"    padding: 16px;"
-"    background: #f8f9fa;"
-"    border-radius: 8px;"
-"}"
-".control-label {"
-"    font-size: 1.1em;"
-"    color: #1a1a1a;"
-"}"
-".control-input {"
-"    display: flex;"
-"    align-items: center;"
-"    gap: 12px;"
-"}"
-"input {"
-"    width: 100px;"
-"    padding: 8px 12px;"
-"    border: 1px solid #ddd;"
-"    border-radius: 6px;"
-"    font-size: 1em;"
-"    text-align: center;"
-"}"
-"button {"
-"    padding: 8px 20px;"
-"    border: none;"
-"    border-radius: 6px;"
-"    background: #0066ff;"
-"    color: white;"
-"    font-size: 1em;"
-"    cursor: pointer;"
-"    transition: all 0.2s;"
-"    position: relative;"
-"}"
-"button:hover {"
-"    background: #0052cc;"
-"}"
-"button:disabled {"
-"    background: #ccc;"
-"    cursor: not-allowed;"
-"}"
-"button.loading {"
-"    padding-right: 40px;"
-"}"
-"button.loading:after {"
-"    content: '';"
-"    position: absolute;"
-"    right: 10px;"
-"    top: 50%;"
-"    width: 20px;"
-"    height: 20px;"
-"    margin-top: -10px;"
-"    border: 2px solid #fff;"
-"    border-top-color: transparent;"
-"    border-radius: 50%;"
-"    animation: spin 1s linear infinite;"
-"}"
-"@keyframes spin {"
-"    to { transform: rotate(360deg); }"
-"}"
-".toast {"
-"    position: fixed;"
-"    bottom: 20px;"
-"    left: 50%;"
-"    transform: translateX(-50%);"
-"    background: rgba(0,0,0,0.8);"
-"    color: white;"
-"    padding: 12px 24px;"
-"    border-radius: 6px;"
-"    font-size: 1em;"
-"    opacity: 0;"
-"    transition: opacity 0.3s;"
-"    pointer-events: none;"
-"}"
-".toast.show {"
-"    opacity: 1;"
-"}"
-".heater-on {"
-"    color: #ff4d4f;"
-"}"
-".heater-off {"
-"    color: #52c41a;"
-"}"
-".logs {"
-"    background: #f8f9fa;"
-"    border-radius: 8px;"
-"    padding: 16px;"
-"    max-height: 400px;"
-"    overflow-y: auto;"
-"    font-family: monospace;"
-"    font-size: 0.9em;"
-"    line-height: 1.5;"
-"}"
-".log-entry {"
-"    padding: 4px 0;"
-"    border-bottom: 1px solid #eee;"
-"}"
-".log-time {"
-"    color: #666;"
-"    margin-right: 8px;"
-"}"
-"</style></head>"
-"<body>"
-"<div class='container'>"
-"    <div class='card'>"
-"        <h2>系统状态</h2>"
-"        <div class='status'>"
-"            <div class='status-item'>"
-"                <div class='status-label'>当前温度</div>"
-"                <div class='status-value' id='temp'>--°C</div>"
-"            </div>"
-"            <div class='status-item'>"
-"                <div class='status-label'>当前湿度</div>"
-"                <div class='status-value' id='humidity'>--%</div>"
-"            </div>"
-"            <div class='status-item'>"
-"                <div class='status-label'>加热器状态</div>"
-"                <div class='status-value' id='heater'>--</div>"
-"            </div>"
-"        </div>"
-"    </div>"
-"    <div class='card'>"
-"        <h2>温度控制</h2>"
-"        <div class='control'>"
-"            <div class='control-label'>白天温度 (6:00-22:00)</div>"
-"            <div class='control-input'>"
-"                <input type='number' id='day_target' step='0.1' min='5' max='30'>"
-"                <span>°C</span>"
-"                <button onclick='setDayTarget()'>设置</button>"
-"            </div>"
-"        </div>"
-"        <div class='control'>"
-"            <div class='control-label'>夜间温度 (22:00-6:00)</div>"
-"            <div class='control-input'>"
-"                <input type='number' id='night_target' step='0.1' min='5' max='30'>"
-"                <span>°C</span>"
-"                <button onclick='setNightTarget()'>设置</button>"
-"            </div>"
-"        </div>"
-"        <div class='control'>"
-"            <div class='control-label'>温度滞后</div>"
-"            <div class='control-input'>"
-"                <input type='number' id='hysteresis' step='0.1' min='0.1' max='2.0'>"
-"                <span>°C</span>"
-"                <button onclick='setHysteresis()'>设置</button>"
-"            </div>"
-"        </div>"
-"    </div>"
-"    <div class='card'>"
-"        <h2>温度曲线</h2>"
-"        <div class='chart-container'>"
-"            <canvas id='tempChart'></canvas>"
-"        </div>"
-"    </div>"
-"    <div class='card'>"
-"        <h2>系统日志</h2>"
-"        <div class='logs' id='logs'></div>"
-"    </div>"
-"</div>"
-"<div id='toast' class='toast'></div>"
-"<script>"
-"var tempData = {"
-"    labels: [],"
-"    datasets: [{"
-"        label: '温度 (°C)',"
-"        data: [],"
-"        borderColor: 'rgb(75, 192, 192)',"
-"        backgroundColor: 'rgba(75, 192, 192, 0.1)',"
-"        fill: true,"
-"        tension: 0.3,"
-"        yAxisID: 'y',"
-"        pointRadius: 0,"
-"        borderWidth: 2"
-"    }, {"
-"        label: '加热状态',"
-"        data: [],"
-"        borderColor: 'rgb(255, 99, 132)',"
-"        backgroundColor: 'rgba(255, 99, 132, 0.1)',"
-"        fill: true,"
-"        stepped: true,"
-"        yAxisID: 'y1',"
-"        pointRadius: 0,"
-"        borderWidth: 2"
-"    }]"
-"};"
-""
-"var tempConfig = {"
-"    type: 'line',"
-"    data: tempData,"
-"    options: {"
-"        responsive: true,"
-"        maintainAspectRatio: false,"
-"        interaction: {"
-"            mode: 'index',"
-"            intersect: false"
-"        },"
-"        plugins: {"
-"            legend: {"
-"                position: 'top',"
-"                labels: {"
-"                    usePointStyle: true,"
-"                    padding: 20"
-"                }"
-"            }"
-"        },"
-"        scales: {"
-"            x: {"
-"                type: 'time',"
-"                time: {"
-"                    unit: 'minute',"
-"                    displayFormats: {"
-"                        minute: 'HH:mm'"
-"                    }"
-"                },"
-"                grid: {"
-"                    display: false"
-"                },"
-"                title: {"
-"                    display: true,"
-"                    text: '时间'"
-"                }"
-"            },"
-"            y: {"
-"                type: 'linear',"
-"                display: true,"
-"                position: 'left',"
-"                title: {"
-"                    display: true,"
-"                    text: '温度 (°C)'"
-"                }"
-"            },"
-"            y1: {"
-"                type: 'linear',"
-"                display: true,"
-"                position: 'right',"
-"                min: -0.1,"
-"                max: 1.1,"
-"                grid: {"
-"                    drawOnChartArea: false"
-"                },"
-"                title: {"
-"                    display: true,"
-"                    text: '加热状态'"
-"                },"
-"                ticks: {"
-"                    callback: function(value) {"
-"                        return value > 0.5 ? '开启' : '关闭';"
-"                    }"
-"                }"
-"            }"
-"        }"
-"    }"
-"};"
-""
-"var ctx = document.getElementById('tempChart').getContext('2d');"
-"var tempChart = new Chart(ctx, tempConfig);"
-""
-"function updateChart(temp, heaterState) {"
-"    var now = new Date();"
-"    tempData.labels.push(now);"
-"    tempData.datasets[0].data.push(temp);"
-"    tempData.datasets[1].data.push(heaterState ? 1 : 0);"
-"    "
-"    var twoHoursAgo = now - 2 * 60 * 60 * 1000;"
-"    var cutoffIndex = tempData.labels.findIndex(function(time) {"
-"        return time > twoHoursAgo;"
-"    });"
-"    "
-"    if (cutoffIndex > 0) {"
-"        tempData.labels.splice(0, cutoffIndex);"
-"        tempData.datasets[0].data.splice(0, cutoffIndex);"
-"        tempData.datasets[1].data.splice(0, cutoffIndex);"
-"    }"
-"    "
-"    tempChart.update();"
-"}"
-""
-"function updateStatus() {"
-"    fetch('/api/status').then(r=>r.json()).then(data=>{"
-"        document.getElementById('temp').textContent = `${data.current_temp.toFixed(1)}°C`;"
-"        document.getElementById('humidity').textContent = `${data.current_humidity.toFixed(1)}%`;"
-"        document.getElementById('heater').textContent = data.heater_state ? '开启' : '关闭';"
-"        document.getElementById('heater').className = "
-"            'status-value ' + (data.heater_state ? 'heater-on' : 'heater-off');"
-"        updateChart(data.current_temp, data.heater_state);"
-"    }).catch(err => console.error('更新状态失败:', err));"
-"}"
-"function loadSettings() {"
-"    fetch('/api/status').then(r=>r.json()).then(data=>{"
-"        document.getElementById('day_target').value = data.day_temp_target.toFixed(1);"
-"        document.getElementById('night_target').value = data.night_temp_target.toFixed(1);"
-"        document.getElementById('hysteresis').value = data.hysteresis.toFixed(1);"
-"    }).catch(err => console.error('加载设置失败:', err));"
-"}"
-"function showToast(message, duration = 2000) {"
-"    const toast = document.getElementById('toast');"
-"    toast.textContent = message;"
-"    toast.classList.add('show');"
-"    setTimeout(() => toast.classList.remove('show'), duration);"
-"}"
-"function setButtonLoading(btn, loading) {"
-"    btn.disabled = loading;"
-"    if (loading) {"
-"        btn.classList.add('loading');"
-"    } else {"
-"        btn.classList.remove('loading');"
-"    }"
-"}"
-"function setDayTarget() {"
-"    const btn = event.target;"
-"    const temp = document.getElementById('day_target').value;"
-"    setButtonLoading(btn, true);"
-"    fetch('/api/settings', {"
-"        method: 'POST',"
-"        headers: {'Content-Type': 'application/json'},"
-"        body: JSON.stringify({day_temp_target: parseFloat(temp)})"
-"    }).then(r => r.json())"
-"      .then(data => {"
-"        if(data.status === 'success') {"
-"            document.getElementById('day_target').value = data.day_temp_target.toFixed(1);"
-"            showToast('白天温度已更新');"
-"        }"
-"    }).catch(err => {"
-"        console.error('设置白天温度失败:', err);"
-"        showToast('设置失败，请重试');"
-"    }).finally(() => {"
-"        setButtonLoading(btn, false);"
-"    });"
-"}"
-"function setNightTarget() {"
-"    const btn = event.target;"
-"    const temp = document.getElementById('night_target').value;"
-"    setButtonLoading(btn, true);"
-"    fetch('/api/settings', {"
-"        method: 'POST',"
-"        headers: {'Content-Type': 'application/json'},"
-"        body: JSON.stringify({night_temp_target: parseFloat(temp)})"
-"    }).then(r => r.json())"
-"      .then(data => {"
-"        if(data.status === 'success') {"
-"            document.getElementById('night_target').value = data.night_temp_target.toFixed(1);"
-"            showToast('夜间温度已更新');"
-"        }"
-"    }).catch(err => {"
-"        console.error('设置夜间温度失败:', err);"
-"        showToast('设置失败，请重试');"
-"    }).finally(() => {"
-"        setButtonLoading(btn, false);"
-"    });"
-"}"
-"function setHysteresis() {"
-"    const btn = event.target;"
-"    const hyst = document.getElementById('hysteresis').value;"
-"    setButtonLoading(btn, true);"
-"    fetch('/api/settings', {"
-"        method: 'POST',"
-"        headers: {'Content-Type': 'application/json'},"
-"        body: JSON.stringify({hysteresis: parseFloat(hyst)})"
-"    }).then(r => r.json())"
-"      .then(data => {"
-"        if(data.status === 'success') {"
-"            document.getElementById('hysteresis').value = data.hysteresis.toFixed(1);"
-"            showToast('温度滞后已更新');"
-"        }"
-"    }).catch(err => {"
-"        console.error('设置温度滞后失败:', err);"
-"        showToast('设置失败，请重试');"
-"    }).finally(() => {"
-"        setButtonLoading(btn, false);"
-"    });"
-"}"
-"function updateLogs() {"
-"    fetch('/api/logs').then(r=>r.json()).then(logs=>{"
-"        const logsHtml = logs.map(log => `"
-"            <div class='log-entry'>"
-"                <span class='log-time'>${log.time}</span>"
-"                <span class='log-msg'>${log.msg}</span>"
-"            </div>"
-"        `).join('');"
-"        document.getElementById('logs').innerHTML = logsHtml;"
-"    }).catch(err => console.error('更新日志失败:', err));"
-"}"
-"loadSettings();"
-"setInterval(updateStatus, 5000);"
-"updateStatus();"
-"setInterval(updateLogs, 5000);"  // 每5秒更新一次日志
-"updateLogs();"  // 立即更新一次
-"</script>"
-"</body></html>";
+// 保存温度数据
+void save_temp_data(float temp, int heater_state) {
+    db_save_temp_data(temp, temp_control->current_humidity, heater_state);
+}
+
+// 获取今天的温度数据
+char* get_today_data(void) {
+    char today[11];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(today, sizeof(today), "%Y-%m-%d", tm_info);
+    return db_get_temp_data(today);
+}
 
 // 处理GET请求的回调函数
 static enum MHD_Result handle_get_request(void *cls, struct MHD_Connection *connection,
@@ -613,6 +238,28 @@ static enum MHD_Result handle_get_request(void *cls, struct MHD_Connection *conn
                                                  MHD_RESPMEM_MUST_COPY);
         MHD_add_response_header(response, "Content-Type", "application/json");
         json_object_put(json_array);
+    } else if (strncmp(url, "/api/temp_data", 13) == 0) {
+        const char* date_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "date");
+        char* data;
+        if (date_param) {
+            // 如果提供了日期参数，使用指定日期
+            data = db_get_temp_data(date_param);
+        } else {
+            // 否则使用今天的日期
+            char today[11];
+            time_t now = time(NULL);
+            strftime(today, sizeof(today), "%Y-%m-%d", localtime(&now));
+            data = db_get_temp_data(today);
+        }
+        
+        if (!data) {
+            data = strdup("{\"data\":[]}");
+        }
+        
+        response = MHD_create_response_from_buffer(strlen(data),
+                                                 (void*)data,
+                                                 MHD_RESPMEM_MUST_FREE);
+        MHD_add_response_header(response, "Content-Type", "application/json");
     } else {
         const char *not_found = "404 Not Found";
         response = MHD_create_response_from_buffer(strlen(not_found),
@@ -636,71 +283,109 @@ static enum MHD_Result handle_post_request(void *cls, struct MHD_Connection *con
     static int dummy;
     struct MHD_Response *response;
     enum MHD_Result ret;
-
-    // 处理 OPTIONS 请求
-    if (strcmp(method, "OPTIONS") == 0) {
-        response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
-        MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
-        MHD_add_response_header(response, "Access-Control-Allow-Methods", "POST, OPTIONS");
-        MHD_add_response_header(response, "Access-Control-Allow-Headers", "Content-Type");
-        ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-        MHD_destroy_response(response);
-        return ret;
-    }
+    json_object *response_json = NULL;
+    static char buffer[1024];
+    static size_t buffer_pos = 0;
 
     if (*con_cls == NULL) {
         *con_cls = &dummy;
+        buffer_pos = 0;
         return MHD_YES;
     }
 
     if (*upload_data_size != 0) {
         // 处理上传的数据
-        static char buffer[1024];
-        if (*upload_data_size > sizeof(buffer) - 1)
+        if (buffer_pos + *upload_data_size > sizeof(buffer) - 1)
             return MHD_NO;
         
-        memcpy(buffer, upload_data, *upload_data_size);
-        buffer[*upload_data_size] = '\0';
+        memcpy(buffer + buffer_pos, upload_data, *upload_data_size);
+        buffer_pos += *upload_data_size;
         *upload_data_size = 0;
-        
-        // 解析JSON请求
-        json_object *json = json_tokener_parse(buffer);
-        if (json) {
-            json_object *day_temp_obj;
-            if (json_object_object_get_ex(json, "day_temp_target", &day_temp_obj)) {
-                temp_control->day_temp_target = json_object_get_double(day_temp_obj);
-                printf("更新白天目标温度: %.1f°C\n", temp_control->day_temp_target);
-                save_config(temp_control);
-            }
-            json_object *night_temp_obj;
-            if (json_object_object_get_ex(json, "night_temp_target", &night_temp_obj)) {
-                temp_control->night_temp_target = json_object_get_double(night_temp_obj);
-                printf("更新夜间目标温度: %.1f°C\n", temp_control->night_temp_target);
-                save_config(temp_control);
-            }
-            json_object *hyst_obj;
-            if (json_object_object_get_ex(json, "hysteresis", &hyst_obj)) {
-                temp_control->temp_hysteresis = json_object_get_double(hyst_obj);
-                printf("更新温度滞后: %.1f°C\n", temp_control->temp_hysteresis);
-            }
-            json_object_put(json);
-            
-            // 保存配置到文件
-            if (save_config(temp_control) != 0) {
-                printf("保存配置失败\n");
-            }
-        }
-        
         return MHD_YES;
     }
 
-    // 创建响应
-    json_object *response_json = json_object_new_object();
-    json_object_object_add(response_json, "status", json_object_new_string("success"));
-    json_object_object_add(response_json, "day_temp_target", json_object_new_double(temp_control->day_temp_target));
-    json_object_object_add(response_json, "night_temp_target", json_object_new_double(temp_control->night_temp_target));
-    json_object_object_add(response_json, "hysteresis", json_object_new_double(temp_control->temp_hysteresis));
+    // 确保数据以null结尾
+    buffer[buffer_pos] = '\0';
     
+    // 根据URL路由处理不同的POST请求
+    if (strcmp(url, "/api/settings") == 0) {
+        // 解析JSON请求
+        json_object *json = json_tokener_parse(buffer);
+        if (json) {
+            bool config_changed = false;
+            
+            // 处理白天温度设置
+            json_object *day_temp_obj;
+            if (json_object_object_get_ex(json, "day_temp_target", &day_temp_obj)) {
+                temp_control->day_temp_target = json_object_get_double(day_temp_obj);
+                logger_log(LOG_LEVEL_INFO, "更新白天目标温度: %.1f°C", temp_control->day_temp_target);
+                config_changed = true;
+            }
+            
+            // 处理夜间温度设置
+            json_object *night_temp_obj;
+            if (json_object_object_get_ex(json, "night_temp_target", &night_temp_obj)) {
+                temp_control->night_temp_target = json_object_get_double(night_temp_obj);
+                logger_log(LOG_LEVEL_INFO, "更新夜间目标温度: %.1f°C", temp_control->night_temp_target);
+                config_changed = true;
+            }
+            
+            // 处理温度滞后设置
+            json_object *hyst_obj;
+            if (json_object_object_get_ex(json, "hysteresis", &hyst_obj)) {
+                temp_control->temp_hysteresis = json_object_get_double(hyst_obj);
+                logger_log(LOG_LEVEL_INFO, "更新温度滞后: %.1f°C", temp_control->temp_hysteresis);
+                config_changed = true;
+            }
+            
+            // 如果配置有变化，保存到文件
+            if (config_changed) {
+                if (save_config(temp_control) != 0) {
+                    logger_log(LOG_LEVEL_ERROR, "保存配置失败");
+                    // 创建错误响应
+                    response_json = json_object_new_object();
+                    json_object_object_add(response_json, "status", json_object_new_string("error"));
+                    json_object_object_add(response_json, "message", json_object_new_string("保存配置失败"));
+                } else {
+                    // 创建成功响应
+                    response_json = json_object_new_object();
+                    json_object_object_add(response_json, "status", json_object_new_string("success"));
+                    json_object_object_add(response_json, "day_temp_target", json_object_new_double(temp_control->day_temp_target));
+                    json_object_object_add(response_json, "night_temp_target", json_object_new_double(temp_control->night_temp_target));
+                    json_object_object_add(response_json, "hysteresis", json_object_new_double(temp_control->temp_hysteresis));
+                }
+            } else {
+                // 没有任何设置被更新
+                response_json = json_object_new_object();
+                json_object_object_add(response_json, "status", json_object_new_string("error"));
+                json_object_object_add(response_json, "message", json_object_new_string("没有任何设置被更新"));
+            }
+            
+            json_object_put(json);
+        } else {
+            // JSON解析失败
+            response_json = json_object_new_object();
+            json_object_object_add(response_json, "status", json_object_new_string("error"));
+            json_object_object_add(response_json, "message", json_object_new_string("无效的JSON格式"));
+        }
+    } else {
+        // 未知的POST请求URL
+        const char *error_msg = "404 Not Found";
+        response = MHD_create_response_from_buffer(strlen(error_msg),
+                                                 (void*)error_msg,
+                                                 MHD_RESPMEM_PERSISTENT);
+        MHD_add_response_header(response, "Content-Type", "text/plain");
+        return MHD_queue_response(connection, MHD_HTTP_NOT_FOUND, response);
+    }
+
+    // 如果没有设置响应JSON，创建一个默认的错误响应
+    if (!response_json) {
+        response_json = json_object_new_object();
+        json_object_object_add(response_json, "status", json_object_new_string("error"));
+        json_object_object_add(response_json, "message", json_object_new_string("未知错误"));
+    }
+    
+    // 发送响应
     const char *json_str = json_object_to_json_string(response_json);
     response = MHD_create_response_from_buffer(strlen(json_str),
                                              (void*)json_str,
@@ -730,9 +415,25 @@ static enum MHD_Result request_handler(void *cls, struct MHD_Connection *connect
     return MHD_NO;
 }
 
+// 清理过期数据
+void cleanup_old_data(void) {
+    time_t now = time(NULL);
+    time_t retention_time = now - (30 * 24 * 60 * 60); // 保留30天数据
+    db_cleanup_old_data(retention_time);
+}
+
 // 启动Web服务器
 int start_webserver(TempControl *ctrl) {
     temp_control = ctrl;
+    
+    // 初始化配置目录
+    if (init_config_dir() != 0) {
+        printf("配置目录初始化失败: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    // 清理过期数据
+    cleanup_old_data();
     
     // 尝试加载配置
     load_config(temp_control);  // 即使失败也继续

@@ -12,6 +12,7 @@
 #include "aht10.h"
 #include "webserver.h"
 #include "logger.h"
+#include "database.h"
 
 #define MQTT_HOST "localhost"
 #define MQTT_PORT 1883
@@ -105,6 +106,24 @@ void mqtt_publish_callback(struct mosquitto *mosq, void *obj, int mid) {
 
 // 控制LED的函数
 void control_led(int on) {
+    // 检查当前时间
+    time_t now;
+    struct tm *timeinfo;
+    time(&now);
+    timeinfo = localtime(&now);
+    int current_hour = timeinfo->tm_hour;
+
+    // 晚上（22:00-06:00）不显示LED
+    if (current_hour >= 22 || current_hour < 6) {
+        FILE *fp = fopen(LED_TRIGGER_PATH, "w");
+        if (fp) {
+            fprintf(fp, "none");
+            fclose(fp);
+        }
+        return;
+    }
+
+    // 白天正常显示LED
     FILE *fp = fopen(LED_TRIGGER_PATH, "w");
     if (fp) {
         fprintf(fp, "%s", on ? "heartbeat" : "none");
@@ -175,18 +194,19 @@ void temp_control_loop(TempControl *ctrl, struct mosquitto *mosq) {
                    ctrl->current_temp, target_temp, ctrl->temp_hysteresis);
         }
     }
-    // 如果当前温度高于目标温度，关闭加热
-    else if (ctrl->current_temp > target_temp) {
+    // 如果当前温度高于目标温度加上滞后值，关闭加热
+    else if (ctrl->current_temp > target_temp + ctrl->temp_hysteresis) {
         if (ctrl->heater_state) {
             rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_CONTROL, 3, "OFF", 0, false);
             if (rc != MOSQ_ERR_SUCCESS) {
                 logger_log(LOG_LEVEL_ERROR, "MQTT发布失败: %s", mosquitto_strerror(rc));
             }
             ctrl->heater_state = 0;
-            add_log("加热器关闭：当前温度 %.1f°C > 目标温度 %.1f°C", 
-                   ctrl->current_temp, target_temp);
+            add_log("加热器关闭：当前温度 %.1f°C > 目标温度 %.1f°C + %.1f°C", 
+                   ctrl->current_temp, target_temp, ctrl->temp_hysteresis);
         }
     }
+    // 在滞后区间内保持当前状态
 }
 
 int main(int argc, char *argv[]) {
@@ -255,6 +275,12 @@ int main(int argc, char *argv[]) {
     // 初始化时关闭LED
     control_led(0);
 
+    // 初始化数据库
+    if (db_init() != 0) {
+        logger_log(LOG_LEVEL_ERROR, "数据库初始化失败");
+        return -1;
+    }
+
     // 启动Web服务器
     if (start_webserver(&temp_control) != 0) {
         logger_log(LOG_LEVEL_ERROR, "Web服务器启动失败");
@@ -271,7 +297,7 @@ int main(int argc, char *argv[]) {
         // 每30秒发送一次心跳包
         if (current_time - last_heartbeat >= 30) {
             rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_HEARTBEAT, 2, "ping", 0, false);
-            if (rc != MOSQ_ERR_SUCCESS) {
+                if (rc != MOSQ_ERR_SUCCESS) {
                 logger_log(LOG_LEVEL_ERROR, "心跳包发送失败: %s", mosquitto_strerror(rc));
             }
             last_heartbeat = current_time;
@@ -281,6 +307,9 @@ int main(int argc, char *argv[]) {
             logger_log(LOG_LEVEL_INFO, "温度: %.1f°C, 湿度: %.1f%%, 加热器当前状态: %s", 
                    temp_control.current_temp, temp_control.current_humidity,
                    temp_control.heater_state ? "开启" : "关闭");
+
+            // 保存温度数据
+            save_temp_data(temp_control.current_temp, temp_control.heater_state);
 
             // 只在ESP8266在线时执行温控逻辑
             if (esp8266_online) {
@@ -299,14 +328,15 @@ int main(int argc, char *argv[]) {
     // 程序结束时关闭LED
     control_led(0);
 
-    // 清理
+    // 清理资源
     logger_log(LOG_LEVEL_INFO, "程序结束");
     stop_webserver();
     mosquitto_loop_stop(mosq, true);
+    db_close();
+    logger_cleanup();
     mosquitto_destroy(mosq);
     mosquitto_lib_cleanup();
     aht10_close(i2c_fd);
-    logger_cleanup();
 
     return 0;
 } 
