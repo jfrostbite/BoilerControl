@@ -23,3 +23,39 @@ temp_control.conf
 
 # 配置文件（如果不想纳入版本控制）
 *.conf
+
+# 编译输出
+linux/temp_control
+*.o
+*.out
+*.exe
+
+# 依赖目录
+node_modules/
+vendor/
+
+# IDE 和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 数据和日志文件
+*.db
+*.log
+*.sqlite
+*.sqlite3
+
+# 配置文件（可能包含敏感信息）
+config.json
+.env
+
+# 临时文件
+*.tmp
+*.bak
+*.backup
